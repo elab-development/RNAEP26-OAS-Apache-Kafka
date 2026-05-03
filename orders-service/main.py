@@ -1,37 +1,30 @@
 from fastapi import FastAPI, HTTPException
 from typing import List
-import requests
+from aiokafka import AIOKafkaProducer
+from contextlib import asynccontextmanager
 from models import Order
 
-app = FastAPI(title="Orders Service")
+producer = AIOKafkaProducer(bootstrap_servers='kafka:9092')
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await producer.start()
+    yield
+    await producer.stop()
+
+app = FastAPI(title="Orders Service", lifespan=lifespan)
 
 orders_db: List[Order] = []
 
-PRODUCTS_URL = "http://products-service:8000/products"
-NOTIFICATIONS_URL = "http://notifications-service:8000/notifications"
-
-@app.get("/orders", response_model=List[Order])
+@app.get("/orders")
 def get_orders():
     return orders_db
 
 @app.post("/orders", response_model=Order)
-def create_order(order: Order):
-    response = requests.get(f"{PRODUCTS_URL}/{order.product_id}")
-    if response.status_code != 200:
-        raise HTTPException(status_code=404, detail="Product not found")
-
-    product = response.json()
-    if product["quantity"] < order.quantity:
-        raise HTTPException(status_code=400, detail="Not enough stock")
-
-    requests.put(f"{PRODUCTS_URL}/{order.product_id}/reduce", params={"quantity": order.quantity})
-
+async def create_order(order: Order):
+    try:
+        await producer.send_and_wait("order-created", order.model_dump_json().encode('utf-8'))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     orders_db.append(order)
-
-    requests.post(NOTIFICATIONS_URL, json={
-        "order_id": order.id,
-        "product_id": order.product_id,
-        "message": f"Order {order.id} for product {order.product_id} has been placed."
-    })
-
     return order
